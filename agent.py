@@ -3,8 +3,26 @@ import sys
 import chromadb
 import asyncio
 import json
+import redis.asyncio as redis
 from google import genai
 from dotenv import load_dotenv
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import declarative_base
+from sqlalchemy import text, Column, Integer, String, Text, DateTime, select
+from datetime import datetime
+
+# 定义Base ORM基类
+Base = declarative_base()
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(String(50), index=True)
+    role = Column(String(50))  # 'user' 或 'model'
+    content = Column(Text)  # 消息内容
+    created_at = Column(DateTime, default=datetime.utcnow)  # 消息时间戳
 
 
 def get_project_tech_stack(project_name: str):
@@ -68,27 +86,96 @@ class ResumeAgent:
         # self.history = self._load_history()
         self.histories = {}  # 结构 {"user:id": [messages...]}
 
-    # 为每个用户生成独立的文件路径
-    def _get_history_path(self, user_id):
-        return f"chat_history_{user_id}.json"
+        db_user = os.getenv("DB_USER")
+        db_password = os.getenv("DB_PASSWORD")
+        db_host = os.getenv("DB_HOST")
+        db_name = os.getenv("DB_NAME")
 
-    def _load_user_history(self, user_id):
-        """从文件加载聊天历史"""
-        path = self._get_history_path(user_id)
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        return []
+        self.db_url = (
+            f"postgresql+asyncpg://{db_user}:{db_password}@{db_host}/{db_name}"
+        )
 
-    def _save_user_history(self, user_id, history):
-        path = self._get_history_path(user_id)
-        # 只保留最近20条对话，防止历史过长
-        if len(history) > 20:
-            history = history[-20:]
+        # 创建异步数据库引擎
+        self.engine = create_async_engine(self.db_url, echo=False)
 
-        """将最新的history对象序列化并保存到文件"""
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
+        # 创建会话工厂
+        self.AysncSessionLocal = async_sessionmaker(
+            bind=self.engine, class_=AsyncSession, expire_on_commit=False
+        )
+
+        # 初始化redis连接
+        self.redis_client = redis.Redis(
+            host=os.getenv("REDIS_HOST"),
+            port=6379,
+            db=0,
+            decode_responses=True,  # 自动把bytes转换成str
+        )
+
+        self.cache_expire = 3600  # 缓存1小时
+
+    async def _get_cache_key(self, user_id: str):
+        return f"chat_cache:{user_id}"
+
+    async def init_db(self):
+        """初始化数据库"""
+        async with self.engine.begin() as conn:
+            # 使用SQLAlchemy的模型映射自动建表
+            await conn.run_sync(Base.metadata.create_all)
+            print("数据库表结构完成")
+
+    async def _save_message(self, user_id: str, role: str, content: str):
+        """双写逻辑：PG 永久存，Redis 更新缓存"""
+
+        # 1. 异步写入PostgreSQL数据库
+        async with self.AysncSessionLocal() as session:
+            async with session.begin():  # 自动处理begin和commit/rollback
+                new_message = ChatMessage(
+                    user_id=user_id,
+                    role=role,
+                    content=content,
+                )
+                session.add(new_message)
+            # 离开async with时，session会自动关闭
+        
+        # 2. 更新Redis缓存
+        cache_key = await self._get_cache_key(user_id)
+        await self.redis_client.delete(cache_key)  # 删除旧缓存，下一次查询会从PG加载最新数据
+
+    async def _load_history(self, user_id, limit: int = 10):
+        """双级缓存查询 Redis->PG"""
+        cache_key = await self._get_cache_key(user_id)
+
+        # 1. 先查Redis缓存
+        cached_data = await self.redis_client.get(cache_key)
+        if cached_data:
+            print(f"从Redis缓存中加载用户 {user_id} 的历史记录")
+            return json.loads(cached_data)
+
+        """ redis没命中，从PG加载最近的历史记录"""
+        print(f"[PG]Redis未命中，从数据库中读取用户 {user_id} 的历史记录")
+        async with self.AysncSessionLocal() as session:
+            # 查最近的N条，按时间降序排列
+            stmt = (
+                select(ChatMessage)
+                .where(ChatMessage.user_id == user_id)
+                .order_by(ChatMessage.created_at.desc())
+                .limit(limit)
+            )
+            result = await session.execute(stmt)
+            messages = result.scalars().all()
+            # 转换成模型需要的格式，注意要逆序（从旧到新）
+            history = [
+                {"role": msg.role, "parts": [{"text": msg.content}]}
+                for msg in reversed(messages)
+            ]
+
+            if history:
+                # 加载到Redis缓存，设置过期时间
+                await self.redis_client.setex(
+                    cache_key, self.cache_expire, json.dumps(history)
+                )
+
+            return history
 
     def _get_embedding(self, text: str):
         result = self.client_ai.models.embed_content(
@@ -111,7 +198,7 @@ class ResumeAgent:
         # 1. 如果会话没有创建，尝试从磁盘恢复
         if user_id not in self.sessions:
             print(f"为用户 {user_id} 创建新会话")
-            user_history = self._load_user_history(user_id)
+            user_history = await self._load_history(user_id)
             self.histories[user_id] = user_history
 
             self.sessions[user_id] = self.client_ai.aio.chats.create(
@@ -136,19 +223,26 @@ class ResumeAgent:
         full_input = f"【参考背景】：{context}\n\n【用户问题】：{user_query}"
 
         # 4. 使用chat_session.send_message来发送消息
-        response = await self.sessions[user_id].send_message(full_input)
+        try:
+            response = await self.sessions[user_id].send_message(full_input)
+            response_text = response.text
+        except Exception as e:
+            print(f"Error while sending message: {e}")
+            response_text = f"对不起，处理您的请求时出错。可能是API超额，这是模拟恢复，我已收到问题:{user_query}"
 
         # 5. 持久化：每次对话完，更新磁盘上的记忆
         self.histories[user_id].append(
             {"role": "user", "parts": [{"text": user_query}]}
         )
         self.histories[user_id].append(
-            {"role": "model", "parts": [{"text": response.text}]}
+            {"role": "model", "parts": [{"text": response_text}]}
         )
 
-        self._save_user_history(user_id, self.histories[user_id])
+        # 6. 异步写入数据库
+        await self._save_message(user_id, "user", user_query)
+        await self._save_message(user_id, "model", response_text)
 
-        return response.text
+        return response_text
 
 
 # 程序入口

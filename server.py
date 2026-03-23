@@ -1,14 +1,25 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from agent import ResumeAgent
+from contextlib import asynccontextmanager
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动时连接数据库
+    await agent.init_db()
+    yield
+    # 关闭时断开数据库连接
+    await agent.engine.dispose()
+    await agent.redis_client.close()
+
+app = FastAPI(lifespan=lifespan)
 agent = ResumeAgent()
 
 
 class QueryRequest(BaseModel):
     user_id: str # 标识用户
     text: str
+
 
 
 @app.get("/")
