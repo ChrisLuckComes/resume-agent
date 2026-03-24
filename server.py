@@ -1,7 +1,8 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks
 from pydantic import BaseModel
 from agent import ResumeAgent
 from contextlib import asynccontextmanager
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -12,14 +13,14 @@ async def lifespan(app: FastAPI):
     await agent.engine.dispose()
     await agent.redis_client.close()
 
+
 app = FastAPI(lifespan=lifespan)
 agent = ResumeAgent()
 
 
 class QueryRequest(BaseModel):
-    user_id: str # 标识用户
+    user_id: str  # 标识用户
     text: str
-
 
 
 @app.get("/")
@@ -32,8 +33,9 @@ async def root():
     summary="与AI职业经纪人对话",
     description="发送问题给 AI 经纪人，支持多轮对话记忆",
 )
-async def chat_endpoint(request: QueryRequest):
+async def chat_endpoint(request: QueryRequest, background_tasks: BackgroundTasks):
     answer = await agent.ask(request.text, request.user_id)
+    background_tasks.add_task(agent.async_persistence, request.user_id, answer)
     return {"reply": answer}
 
 
