@@ -1,29 +1,17 @@
 import os
 import sys
-from chromadb import PersistentClient, chromadb
+import tempfile
+from chromadb import chromadb
 import asyncio
 import json
-import redis.asyncio as redis
 from google import genai
 from dotenv import load_dotenv
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import declarative_base
-from sqlalchemy import text, Column, Integer, String, Text, DateTime, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update
 from datetime import datetime
+from database import AsyncSessionLocal
 from resume_parser import ResumeParser
-
-# 定义Base ORM基类
-Base = declarative_base()
-
-
-class ChatMessage(Base):
-    __tablename__ = "chat_messages"
-
-    id = Column(Integer, primary_key=True)
-    user_id = Column(String(50), index=True)
-    role = Column(String(50))  # 'user' 或 'model'
-    content = Column(Text)  # 消息内容
-    created_at = Column(DateTime, default=datetime.utcnow)  # 消息时间戳
+from models import ChatMessage, Resume, ResumeEvaluation, ResumeStatus
 
 
 def get_project_tech_stack(project_name: str):
@@ -50,13 +38,12 @@ def get_current_date(year: str):
     Args:
         year: 用户输入的年份关键词，例如'11年研发经验'中的'11年'，实际上当前日期可能不止11年了，所以需要获取当前年份来计算实际经验年限，简历中写了毕业年份2014年，所以可以通过当前年份减去2014年来计算实际经验年限。
     """
-    from datetime import datetime
 
     return datetime.now().year - 2014  # 2014是简历中毕业的年份
 
 
 class ResumeAgent:
-    def __init__(self, history_file="chat_history.json"):
+    def __init__(self, redis_client=None):
         load_dotenv()
         self.client_ai = genai.Client(
             api_key=os.getenv("GEMINI_API_KEY")
@@ -83,38 +70,87 @@ class ResumeAgent:
         self.sessions = {}  # 结构 {"user:id": chat_session_object}
 
         # 加载持久化的历史纪录到内存
-        # self.history_file = history_file
-        # self.history = self._load_history()
         self.histories = {}  # 结构 {"user:id": [messages...]}
 
-        db_user = os.getenv("DB_USER")
-        db_password = os.getenv("DB_PASSWORD")
-        db_host = os.getenv("DB_HOST")
-        db_name = os.getenv("DB_NAME")
-
-        self.db_url = (
-            f"postgresql+asyncpg://{db_user}:{db_password}@{db_host}/{db_name}"
-        )
-
-        # 创建异步数据库引擎
-        self.engine = create_async_engine(self.db_url, echo=False)
-
-        # 创建会话工厂
-        self.AysncSessionLocal = async_sessionmaker(
-            bind=self.engine, class_=AsyncSession, expire_on_commit=False
-        )
-
         # 初始化redis连接
-        self.redis_client = redis.Redis(
-            host=os.getenv("REDIS_HOST"),
-            port=6379,
-            db=0,
-            decode_responses=True,  # 自动把bytes转换成str
-        )
+        self.redis_client = redis_client
 
         self.cache_expire = 3600  # 缓存1小时
 
         self.parser = ResumeParser(chunk_size=200, overlap=50)  # 初始化简历解析器
+
+    async def check_and_get_evaluation(
+        self, user_id: str, candidate_name: str, phone: str, db: AsyncSession = None
+    ):
+        # 查询数据库中是否存在该候选人的简历
+        stmt = select(Resume).where(
+            Resume.candidate_name == candidate_name,
+            Resume.phone == phone,
+            Resume.user_id == user_id,
+        )
+
+        result = await db.execute(stmt)
+        record = result.scalar_one_or_none()
+        return record
+
+    async def evaluate_resume(self, resume_text: str):
+        # 结构化prompt
+        prompt = f"""
+        ROLE: 资深前端技术专家
+            OBJECTIVE: 评估以下简历，判定是否符合“资深前端”要求。
+            
+            CONSTRAINTS:
+            - 门槛：本科且5年以上经验。
+            - 逻辑：按照 (C)过程 > (B)架构 > (A)数据 优先级寻找实质产出。
+            - 加分项：体现 AI 工具提效。
+
+            INPUT_RESUME:
+            {resume_text}
+
+            OUTPUT_FORMAT:
+            请严格按照 JSON 格式输出，参考以下结构：
+            {ResumeEvaluation.model_json_schema()}
+        """
+
+        response = await self.client_ai.aio.models.generate_content(
+            model=self.model_name,
+            contents=prompt,
+            config={"response_mime_type": "application/json"},
+        )
+
+        # 转换为python对象
+        result = json.loads(response.text)
+        return result
+
+    async def delete_old_vector_data(self, phone: str):
+        """
+        根据手机号从 ChromaDB 中删除旧数据
+        """
+        self.collection.delete(where={"phone": phone})
+
+    async def extract_info_from_resume(self, resume_text: str):
+        """
+        使用 AI 从简历中提取关键标识信息
+        """
+        prompt = f"""
+        请从以下简历内容中提取候选人的姓名和手机号。
+        如果简历中没有提到手机号，请返回 "None"。
+        
+        简历内容：
+        {resume_text}
+        
+        输出格式（JSON）：
+        {{
+            "candidate_name": "姓名",
+            "phone": "手机号"
+        }}
+        """
+        response = await self.client_ai.aio.models.generate_content(
+            model=self.model_name,
+            contents=prompt,
+            config={"response_mime_type": "application/json"},
+        )
+        return json.loads(response.text)
 
     async def _extract_candidate_name(self, question=str):
         """从用户问题中提取候选人姓名的简单方法，没有返回None"""
@@ -122,25 +158,122 @@ class ResumeAgent:
         从以下问题中提取候选人姓名，如果没有明确的姓名，返回'None'：
         问题：{question}
         """
-        response = await self.client_ai.models.generate_content(
+        response = await self.client_ai.aio.models.generate_content(
             model=self.model_name, contents=prompt
         )
         name = response.text.strip()
         return name if name != "None" else None
 
-    def add_resume(self, file_path, candidate_name):
+    async def _process_file_and_vector(
+        self, file_content: bytes, candidate_name: str, phone: str
+    ):
+        """
+        处理文件内容：解析文本，生成向量，存入ChromaDB
+        返回解析后的纯文本全文
+        """
+
+        temp_path = ""
+        raw_text = ""
+        # 1. 使用临时文件处理二进制流
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as temp_file:
+            temp_file.write(file_content)
+            temp_file.flush()  # 确保数据写入磁盘
+            temp_path = temp_file.name
+        try:
+            # 2. 提取文本
+            raw_text = self.parser.extract_from_docx(temp_path)
+            chunks = self.parser.get_chunks(raw_text)
+        finally:
+            # 3. 删除临时文件
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+        self.collection.delete(where={"phone": phone})  # 删除旧数据
+        embeddings = [self._get_embedding(chunk) for chunk in chunks]
+        metadatas = [
+            {
+                "candidate_name": candidate_name,
+                "phone": phone,
+                "source": "uploaded_resume",
+            }
+            for _ in chunks
+        ]
+        ids = [f"{phone}_{i}" for i in range(len(chunks))]
+
+        self.collection.upsert(
+            ids=ids,
+            metadatas=metadatas,
+            documents=chunks,
+            embeddings=embeddings,
+        )
+        return raw_text
+
+    async def _update_status(
+        self,
+        db: AsyncSession,
+        resume_id: int,
+        new_status: ResumeStatus,
+        content: str = None,
+        evaluation_result: dict = None,
+    ):
+        """更新简历处理状态的辅助函数"""
+        stmt = update(Resume).where(Resume.id == resume_id).values(status=new_status)
+        if content is not None:
+            stmt = stmt.values(content=content)
+        if evaluation_result is not None:
+            stmt = stmt.values(evaluation_result=evaluation_result)
+
+        stmt = stmt.values(updated_at=datetime.now())  # 更新状态时也更新updated_at字段
+
+        await db.execute(stmt)
+        await db.commit()
+        print(f"简历ID {resume_id} 状态已更新为 {new_status.value}")
+
+    async def handle_resume_process(
+        self, resume_id: int, file_content: bytes, candidate_name: str, phone: str
+    ):
+        # 这里需要一个新的db session
+        async with AsyncSessionLocal() as db:
+            try:
+                # 1. 更新数据库状态为解析中
+                await self._update_status(db, resume_id, ResumeStatus.PARSING)
+
+                raw_text = await self._process_file_and_vector(
+                    file_content, candidate_name, phone
+                )
+
+                await self._update_status(
+                    db, resume_id, ResumeStatus.EVALUATING, content=raw_text
+                )
+
+                evaluation_result = await self.evaluate_resume(raw_text)
+
+                await self._update_status(
+                    db,
+                    resume_id,
+                    ResumeStatus.COMPLETED,
+                    evaluation_result=evaluation_result,
+                )
+            except Exception as e:
+                print(f"更新状态失败: {e}")
+                await self._update_status(db, resume_id, ResumeStatus.FAILED)
+
+    async def add_resume(self, file_path, candidate_name, phone):
         # 1. 提取并切分
         doc_text = self.parser.extract_from_docx(file_path)
         chunks = self.parser.get_chunks(doc_text)
+
+        self.collection.delete(where={"phone": phone})
 
         # 生成向量
         embeddings = [self._get_embedding(chunk) for chunk in chunks]
 
         # 2. 准备元数据,每一段都带上候选人姓名
         metadatas = [
-            {"candidate_name": candidate_name, "source": file_path} for _ in chunks
+            {"candidate_name": candidate_name, "phone": phone, "source": file_path}
+            for _ in chunks
         ]
-        ids = [f"{candidate_name}_{i}" for i in range(len(chunks))]
+        ids = [f"{phone}_{i}" for i in range(len(chunks))]
 
         # 3. 存入ChromaDB
         self.collection.upsert(
@@ -158,26 +291,18 @@ class ResumeAgent:
     async def _get_cache_key(self, user_id: str):
         return f"chat_cache:{user_id}"
 
-    async def init_db(self):
-        """初始化数据库"""
-        async with self.engine.begin() as conn:
-            # 使用SQLAlchemy的模型映射自动建表
-            await conn.run_sync(Base.metadata.create_all)
-            print("数据库表结构完成")
-
-    async def _save_message(self, user_id: str, role: str, content: str):
+    async def _save_message(
+        self, user_id: str, role: str, content: str, db: AsyncSession = None
+    ):
         """双写逻辑：PG 永久存，Redis 更新缓存"""
 
-        # 1. 异步写入PostgreSQL数据库
-        async with self.AysncSessionLocal() as session:
-            async with session.begin():  # 自动处理begin和commit/rollback
-                new_message = ChatMessage(
-                    user_id=user_id,
-                    role=role,
-                    content=content,
-                )
-                session.add(new_message)
-            # 离开async with时，session会自动关闭
+        # 1. 写入PostgreSQL数据库
+        new_message = ChatMessage(
+            user_id=user_id,
+            role=role,
+            content=content,
+        )
+        db.add(new_message)
 
         # 2. 更新Redis缓存
         cache_key = await self._get_cache_key(user_id)
@@ -185,7 +310,7 @@ class ResumeAgent:
             cache_key
         )  # 删除旧缓存，下一次查询会从PG加载最新数据
 
-    async def _load_history(self, user_id, limit: int = 10):
+    async def _load_history(self, user_id, limit: int = 10, db: AsyncSession = None):
         """双级缓存查询 Redis->PG"""
         cache_key = await self._get_cache_key(user_id)
 
@@ -197,29 +322,29 @@ class ResumeAgent:
 
         """ redis没命中，从PG加载最近的历史记录"""
         print(f"[PG]Redis未命中，从数据库中读取用户 {user_id} 的历史记录")
-        async with self.AysncSessionLocal() as session:
-            # 查最近的N条，按时间降序排列
-            stmt = (
-                select(ChatMessage)
-                .where(ChatMessage.user_id == user_id)
-                .order_by(ChatMessage.created_at.desc())
-                .limit(limit)
+
+        # 查最近的N条，按时间降序排列
+        stmt = (
+            select(ChatMessage)
+            .where(ChatMessage.user_id == user_id)
+            .order_by(ChatMessage.created_at.desc())
+            .limit(limit)
+        )
+        result = await db.execute(stmt)
+        messages = result.scalars().all()
+        # 转换成模型需要的格式，注意要逆序（从旧到新）
+        history = [
+            {"role": msg.role, "parts": [{"text": msg.content}]}
+            for msg in reversed(messages)
+        ]
+
+        if history:
+            # 加载到Redis缓存，设置过期时间
+            await self.redis_client.setex(
+                cache_key, self.cache_expire, json.dumps(history)
             )
-            result = await session.execute(stmt)
-            messages = result.scalars().all()
-            # 转换成模型需要的格式，注意要逆序（从旧到新）
-            history = [
-                {"role": msg.role, "parts": [{"text": msg.content}]}
-                for msg in reversed(messages)
-            ]
 
-            if history:
-                # 加载到Redis缓存，设置过期时间
-                await self.redis_client.setex(
-                    cache_key, self.cache_expire, json.dumps(history)
-                )
-
-            return history
+        return history
 
     def _get_embedding(self, text: str):
         result = self.client_ai.models.embed_content(
@@ -227,11 +352,15 @@ class ResumeAgent:
         )
         return result.embeddings[0].values
 
-    async def ask(self, question: str, user_id: str, search_filter=None):
+    async def ask(
+        self, question: str, user_id: str, search_filter=None, db: AsyncSession = None
+    ):
+        if not db:
+            raise ValueError("Database session is required")
         # 1. 如果会话没有创建，尝试从磁盘恢复
         if user_id not in self.sessions:
             print(f"为用户 {user_id} 创建新会话")
-            user_history = await self._load_history(user_id)
+            user_history = await self._load_history(user_id, db=db)
             self.histories[user_id] = user_history
 
             self.sessions[user_id] = self.client_ai.aio.chats.create(
@@ -240,19 +369,25 @@ class ResumeAgent:
                 config={
                     "system_instruction": self.system_instruction,
                     "tools": [get_project_tech_stack, get_current_date],
+                    "response_mime_type": "application/json",
                 },
             )
 
         # 2. 完整的RAG问答流程
-        detected_name = await self._extract_candidate_name(question) if not search_filter else search_filter.get("candidate_name")
-        enhanced_query = f"候选人:{detected_name} {question}" if detected_name else question
-        
+        detected_name = (
+            await self._extract_candidate_name(question)
+            if not search_filter
+            else search_filter.get("candidate_name")
+        )
+        enhanced_query = (
+            f"候选人:{detected_name} {question}" if detected_name else question
+        )
+
         query_vector = self._get_embedding(enhanced_query)
 
-
         results = self.collection.query(
-            query_embeddings=[query_vector], 
-            n_results=8, 
+            query_embeddings=[query_vector],
+            n_results=8,
         )
 
         context = (
@@ -279,8 +414,8 @@ class ResumeAgent:
         )
 
         # 6. 异步写入数据库
-        await self._save_message(user_id, "user", question)
-        await self._save_message(user_id, "model", response_text)
+        await self._save_message(user_id, "user", question, db=db)
+        await self._save_message(user_id, "model", response_text, db=db)
 
         return response_text
 
@@ -288,7 +423,7 @@ class ResumeAgent:
 # 程序入口
 async def main():
     # 初始化agent
-    agent = ResumeAgent()
+    # agent = ResumeAgent()
 
     print("AI职业经纪人已启动，输入'exit'退出")
 
