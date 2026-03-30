@@ -1,5 +1,12 @@
 import re
+from pathlib import Path
+
 from docx import Document
+
+try:
+    from pypdf import PdfReader  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover
+    PdfReader = None
 
 
 class ResumeParser:
@@ -8,34 +15,50 @@ class ResumeParser:
         self.overlap = overlap
 
     def _clean_text(self, text):
-        """清理文本，去除多余的空白、制表符和换行"""
-        # 1. 替换制表符
         text = text.replace("\t", " ")
-
-        # 多个连续空格合并为1个
         text = re.sub(r" +", " ", text)
-
-        # 多个连续换行合并为1个
         text = re.sub(r"\n+", "\n", text)
         return text.strip()
 
+    def extract_text(self, file_path):
+        suffix = Path(file_path).suffix.lower()
+        if suffix == ".docx":
+            return self.extract_from_docx(file_path)
+        if suffix == ".pdf":
+            return self.extract_from_pdf(file_path)
+        raise ValueError("仅支持 .docx 或 .pdf 格式")
+
     def extract_from_docx(self, file_path):
-        """从docx文件中提取文本内容并清洗"""
         doc = Document(file_path)
         content = []
 
-        # 1. 提取段落文本
         for paragraph in doc.paragraphs:
-            if paragraph.text.strip():  # 只添加非空段落
+            if paragraph.text.strip():
                 content.append(paragraph.text)
-        # 2. TODO 提取表格文本
+
+        for table in doc.tables:
+            for row in table.rows:
+                row_text = " ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                if row_text:
+                    content.append(row_text)
 
         raw_text = "\n".join(content)
-
         return self._clean_text(raw_text)
 
+    def extract_from_pdf(self, file_path):
+        if PdfReader is None:
+            raise ValueError("当前环境缺少 pypdf，无法解析 PDF 简历")
+
+        reader = PdfReader(file_path)
+        content = []
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            if text.strip():
+                content.append(text)
+
+        return self._clean_text("\n".join(content))
+
     def get_chunks(self, text):
-        """将文本分割成指定大小的块，支持重叠"""
         chunks = []
         start = 0
         text_length = len(text)
@@ -43,10 +66,8 @@ class ResumeParser:
         while start < text_length:
             end = start + self.chunk_size
             chunks.append(text[start:end])
-            # 移动步长 = 窗口大小 - 重叠大小
             start += self.chunk_size - self.overlap
 
-            # 剩余不足一个步长，停止
             if start >= len(text):
                 break
 

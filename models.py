@@ -1,97 +1,112 @@
 from datetime import datetime
-
-from pydantic import BaseModel
-from typing import List, Optional
-
-from sqlalchemy import (
-    Column,
-    DateTime,
-    Integer,
-    String,
-    Text,
-    UniqueConstraint,
-    Index,
-    Enum,
-)
-from sqlalchemy.dialects.postgresql import JSONB
-from database import Base
 import enum
+from typing import Any, List, Optional
+
+from pydantic import BaseModel, Field
+from sqlalchemy import DateTime, Enum, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column
+
+from database import Base
 
 
-class AIResponse(BaseModel):
-    content: str
-    model_name: str
+class RadarMetric(BaseModel):
+    name: str
+    value: int = Field(..., ge=0, le=100)
+    max: int = Field(default=100, ge=1)
 
 
-class VectorData(BaseModel):
-    text: str
-    embedding: List[float]  # 向量，一个浮点数列表
+class EvaluationResult(BaseModel):
+    summary: str
+    title: str
+    decision: str
+    match_score: int = Field(..., ge=0, le=100)
+    radar_metrics: List[RadarMetric] = Field(default_factory=list)
+    highlights: List[str] = Field(default_factory=list)
+    risks: List[str] = Field(default_factory=list)
 
 
-# 定义简历处理状态枚举 📊
 class ResumeStatus(enum.Enum):
-    PENDING = "pending"  # 等待处理
-    PARSING = "parsing"  # 正在解析/向量化
-    EVALUATING = "evaluating"  # 正在 AI 评估
-    COMPLETED = "completed"  # 已完成
-    FAILED = "failed"  # 处理失败
+    PENDING = "pending"
+    PARSING = "parsing"
+    EVALUATING = "evaluating"
+    COMPLETED = "completed"
+    FAILED = "failed"
 
 
 class Resume(Base):
     __tablename__ = "resumes"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(String(50), nullable=False)  # 上传者的用户ID
-    candidate_name = Column(String(100), index=True)  # 候选人姓名
-    phone = Column(String(20), nullable=False)  # 电话号码
-    status = Column(Enum(ResumeStatus), default=ResumeStatus.PENDING)  # 处理状态
-    content = Column(Text)  # 简历文本内容
-    evaluation_result = Column(JSONB, nullable=True)  # AI评估结果，存储为JSON字符串
-    created_at = Column(DateTime, default=datetime.now)  # 上传时间戳
-    updated_at = Column(
-        DateTime, default=datetime.now, onupdate=datetime.now
-    )  # 更新时间戳
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    candidate_name: Mapped[Optional[str]] = mapped_column(String(100), index=True)
+    phone: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[ResumeStatus] = mapped_column(
+        Enum(ResumeStatus), default=ResumeStatus.PENDING, nullable=False
+    )
+    content: Mapped[Optional[str]] = mapped_column(Text)
+    evaluation_result: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.now, onupdate=datetime.now, nullable=False
+    )
 
     __table_args__ = (
-        # 确保同一用户上传的简历中候选人姓名唯一，避免重复上传同一候选人简历
         UniqueConstraint("user_id", "phone", name="_user_phone_uc"),
         Index("ix_user_phone", "user_id", "phone"),
     )
 
 
-class ResumeEvaluation(BaseModel):
-    decision: str  # 决策结果，例如 "通过"、"不通过"、"需要进一步评估"
-    match_score: int  # 0-10
-    tech_stack: List[str]  # 识别出的关键词
-    key_achievements: List[str]  # C（过程）+B（架构）+A（数据） 的实质产出
-    risks: List[str]  # 风险点，例如 "缺乏相关经验"、"技能不匹配"、"过于频繁跳槽" 等
-    ai_bonus: Optional[str]  # AI 额外加分项，例如 "具备领导力潜质"、"有跨领域经验" 等
-
-
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
-    id = Column(Integer, primary_key=True)
-    user_id = Column(String(50), index=True)
-    role = Column(String(50))  # 'user' 或 'model'
-    content = Column(Text)  # 消息内容
-    created_at = Column(DateTime, default=datetime.now)  # 消息时间戳
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(50), index=True, nullable=False)
+    role: Mapped[str] = mapped_column(String(50), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, nullable=False)
 
 
 class QueryRequest(BaseModel):
-    user_id: str  # 标识用户
+    user_id: str
     text: str
+    candidate_name: Optional[str] = None
+    resume_id: Optional[int] = None
 
 
 class EvaluationRequest(BaseModel):
-    candidate_name: str  # 候选人姓名
-    user_id: str  # 用户ID
-    phone: str  # 手机号码
+    user_id: str
+    jd_text: str
+    resume_id: Optional[int] = None
+    candidate_name: Optional[str] = None
+    phone: Optional[str] = None
+    target_seniority: Optional[str] = None
+    jd_keywords: Optional[List[str]] = None
 
 
 class JDAnalysisRequest(BaseModel):
     jd_text: str
+    target_seniority: Optional[str] = None
 
 
 class JDAnalysisResponse(BaseModel):
-    keywords: List[str]
+    keywords: List[str] = Field(default_factory=list)
+
+
+class JDKeywordExtractionResult(BaseModel):
+    keywords: List[str] = Field(default_factory=list, description="仅包含来自JD原文的关键词")
+
+
+class ChatRequest(BaseModel):
+    user_id: str
+    text: str
+    role: str = "user"
+    candidate_name: Optional[str] = None
+    resume_id: Optional[int] = None
+
+
+class OCRResponse(BaseModel):
+    text: str
+
+
+class ChatSuggestionsResponse(BaseModel):
+    suggestions: List[str] = Field(default_factory=list)

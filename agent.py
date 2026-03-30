@@ -1,569 +1,640 @@
-import os
-import sys
-import tempfile
-from chromadb import chromadb
-import asyncio
 import json
-from google import genai
+import importlib
+import os
+import re
+import tempfile
+from pathlib import Path
+from typing import Any, AsyncIterator, Iterable, TypeVar, cast
+
 from dotenv import load_dotenv
+import cv2  # type: ignore[import-not-found]
+from langchain_chroma import Chroma
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+import numpy as np
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
-from datetime import datetime
-from database import AsyncSessionLocal
+
+from pydantic import BaseModel
+
+from models import (
+    ChatMessage,
+    ChatSuggestionsResponse,
+    EvaluationResult,
+    JDAnalysisResponse,
+    JDKeywordExtractionResult,
+    OCRResponse,
+    RadarMetric,
+)
 from resume_parser import ResumeParser
-from models import ChatMessage, Resume, ResumeEvaluation, ResumeStatus
 
 
-def get_project_tech_stack(project_name: str):
-    """
-    当用户询问某个项目的具体技术细节（如使用的中间件、数据库、框架）时，调用此函数获取详细信息。
-
-    Args:
-        project_name: 项目关键词，例如'架构设计'或'金融量化'
-    """
-
-    # 模拟一个从更深的数据库中检索更详细信息的过程
-    detailed_db = {
-        "架构设计": "使用微服务架构，主要技术栈包括Spring Boot, Docker, Kubernetes。",
-        "金融量化": "使用Python进行量化策略开发，主要技术栈包括Pandas, NumPy, scikit-learn。",
-    }
-
-    return detailed_db.get(project_name, "该项目没有更详细的技术文档记录。")
-
-
-def get_current_date(year: str):
-    """
-    当用户询问当前日期或时间相关的问题时，调用此函数获取当前日期。
-
-    Args:
-        year: 用户输入的年份关键词，例如'11年研发经验'中的'11年'，实际上当前日期可能不止11年了，所以需要获取当前年份来计算实际经验年限，简历中写了毕业年份2014年，所以可以通过当前年份减去2014年来计算实际经验年限。
-    """
-
-    return datetime.now().year - 2014  # 2014是简历中毕业的年份
+ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
 class ResumeAgent:
     def __init__(self, redis_client=None):
         load_dotenv()
-        self.client_ai = genai.Client(
-            api_key=os.getenv("GEMINI_API_KEY")
-        )  # Initialize the Gemini API client
+        gemini_api_key = os.getenv("GEMINI_API_KEY")
+        if gemini_api_key and not os.getenv("GOOGLE_API_KEY"):
+            os.environ["GOOGLE_API_KEY"] = gemini_api_key
 
-        self.model_name = os.getenv("GEMINI_MODEL_NAME")
-
-        # 设定静态存储路径，使用ChromaDB来存储简历数据和对应的向量
-        self.client_db = chromadb.PersistentClient(
-            path="./chroma_db"
-        )  # Initialize ChromaDB client
-        self.collection = self.client_db.get_or_create_collection(
-            name="my_resume"
-        )  # Create or get the collection for trading data
-
-        # 设定system instruction，明确AI的角色和行为准则
-        self.system_instruction = """
-        你是一个极其专业的职业经纪人
-        请基于提供的简历片段回答问题。你要说真话，不要为了讨好用户而过度美化
-        如果简历里没写，就直接说不知道，不要瞎编。
-        """
-
-        # 定义一个变量存储会话，初始为 None
-        self.sessions = {}  # 结构 {"user:id": chat_session_object}
-
-        # 加载持久化的历史纪录到内存
-        self.histories = {}  # 结构 {"user:id": [messages...]}
-
-        # 初始化redis连接
+        base_dir = Path(__file__).resolve().parent
+        self.llm = ChatGoogleGenerativeAI(
+            model=os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash"),
+            temperature=0.2,
+        )
+        self.embeddings = GoogleGenerativeAIEmbeddings(
+            model=os.getenv("GEMINI_EMBEDDING_MODEL_NAME", "models/text-embedding-004"),
+        )
+        rapidocr_module = self._load_rapidocr_module()
+        self.ocr_engine = rapidocr_module.RapidOCR() if rapidocr_module is not None else None
+        self.vector_store = Chroma(
+            collection_name="resume_agent",
+            embedding_function=self.embeddings,
+            persist_directory=str(base_dir / "chroma_db"),
+        )
         self.redis_client = redis_client
+        self.cache_expire = 3600
+        self.parser = ResumeParser(chunk_size=500, overlap=80)
+        self.system_instruction = (
+            "你是一名专业招聘顾问。回答必须基于检索到的简历内容和JD信息，"
+            "判断要客观直接，不能编造候选人没写过的经历。"
+        )
 
-        self.cache_expire = 3600  # 缓存1小时
+    async def extract_text_from_image(self, file_bytes: bytes, mime_type: str) -> OCRResponse:
+        if self.ocr_engine is None:
+            raise ValueError("未安装 rapidocr_onnxruntime，无法执行图片OCR")
 
-        self.parser = ResumeParser(chunk_size=200, overlap=50)  # 初始化简历解析器
+        image_buffer = np.frombuffer(file_bytes, dtype=np.uint8)
+        decoded_image = cv2.imdecode(image_buffer, cv2.IMREAD_COLOR)
+        if decoded_image is None:
+            raise ValueError("图片解码失败，无法执行OCR")
 
-    async def extract_jd_info(self, jd_text: str):
-        """
-        直接调用AI抽取岗位、目标、约束，供function calling
-        """
-        prompt = f'请从以下JD描述中提取岗位名称、岗位目标、岗位约束，输出JSON：\nJD描述：{jd_text}\n输出示例：{{"role":"前端开发工程师","objective":"负责核心前端架构设计","constraints":"本科及以上学历，5年以上经验"}}'
-        # 注意：此处需有event loop支持
-        from google import genai
-        import os
+        result, _ = self.ocr_engine(decoded_image)
+        if not result:
+            return OCRResponse(text="")
 
-        client_ai = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-        model_name = os.getenv("GEMINI_MODEL_NAME")
-        response = await client_ai.aio.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config={"response_mime_type": "application/json"},
+        text = "\n".join(item[1] for item in result if len(item) > 1 and item[1].strip())
+        return OCRResponse(text=text.strip())
+
+    async def generate_follow_up_suggestions(
+        self,
+        question: str,
+        answer: str,
+        candidate_name: str | None = None,
+    ) -> list[str]:
+        prompt = ChatPromptTemplate.from_template(
+            """
+            你是招聘顾问，请根据本轮问答生成 3 条适合继续追问的问题。
+            候选人：{candidate_name}
+            用户问题：{question}
+            AI回答：{answer}
+
+            要求：
+            1. 每条都是中文追问句子
+            2. 聚焦简历证据、能力深度、风险确认
+            3. 避免重复
+            """
         )
         try:
-            return json.loads(response.text)
+            structured_llm = self.llm.with_structured_output(ChatSuggestionsResponse)
+            raw_result = await (prompt | structured_llm).ainvoke(
+                {
+                    "candidate_name": candidate_name or "未指定",
+                    "question": question,
+                    "answer": answer,
+                }
+            )
+            result: ChatSuggestionsResponse = self._coerce_model(
+                raw_result, ChatSuggestionsResponse
+            )
+            suggestions = self._unique_strings(result.suggestions)
+            if suggestions:
+                return suggestions[:3]
         except Exception:
-            return {
-                "role": "岗位未知",
-                "objective": "目标未知",
-                "constraints": "无特殊约束",
-            }
+            pass
 
-    async def analyze_jd_keywords(self, jd_text: str):
-        """
-        调用AI分析JD描述，返回关键词列表
-        """
-        prompt = f'请从以下JD描述中提取5个最重要的岗位关键词，输出JSON数组：\n{jd_text}\n输出示例：["Vue3","性能优化","团队管理"]'
-        response = await self.client_ai.aio.models.generate_content(
-            model=self.model_name,
-            contents=prompt,
-            config={"response_mime_type": "application/json"},
+        base_name = candidate_name or "候选人"
+        return [
+            f"{base_name} 在最近一段项目中的具体职责是什么？",
+            f"{base_name} 在关键技术方案里承担了多大 ownership？",
+            f"针对当前岗位要求，{base_name} 最大的风险点是什么？",
+        ]
+
+    async def analyze_jd(self, jd_text: str, target_seniority: str | None = None) -> JDAnalysisResponse:
+        cleaned_text = jd_text.strip()
+        if not cleaned_text:
+            return JDAnalysisResponse(keywords=[])
+
+        return JDAnalysisResponse(
+            keywords=await self._extract_jd_keywords(cleaned_text, target_seniority)
         )
+
+    async def _extract_jd_keywords(
+        self, text: str, target_seniority: str | None = None
+    ) -> list[str]:
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "你是招聘JD关键词抽取助手。你的唯一任务是从输入原文中提取关键词。"
+                    "禁止补充原文未出现的词，禁止改写为同义词，禁止根据常识推断。"
+                    "只保留文本中能直接定位到的技能、工具、业务领域、职责方向、方法论等关键词。"
+                    "不要输出完整句子，不要输出解释，不要把目标级别当作关键词，除非它在原文中明确出现。"
+                    "关键词数量控制在4到8个，若有效关键词不足则按实际数量返回。"
+                ),
+                (
+                    "user",
+                    "请从下面JD原文中提取关键词，仅返回结构化结果。\n"
+                    "目标级别（仅用于理解重点，不能凭空补充成关键词）：{target_seniority}\n\n"
+                    "JD原文：\n{text}",
+                ),
+            ]
+        )
+
         try:
-            return json.loads(response.text)
+            structured_llm = self.llm.with_structured_output(JDKeywordExtractionResult)
+            raw_result = await (prompt | structured_llm).ainvoke(
+                {
+                    "target_seniority": target_seniority or "未指定",
+                    "text": text,
+                }
+            )
+            result: JDKeywordExtractionResult = self._coerce_model(
+                raw_result, JDKeywordExtractionResult
+            )
+            keywords = self._normalize_keyword_candidates(result.keywords, text)
+            if keywords:
+                return keywords[:8]
         except Exception:
-            return []
+            pass
 
-    async def check_and_get_evaluation(
-        self, user_id: str, candidate_name: str, phone: str, db: AsyncSession = None
-    ):
-        # 查询数据库中是否存在该候选人的简历
-        stmt = select(Resume).where(
-            Resume.candidate_name == candidate_name,
-            Resume.phone == phone,
-            Resume.user_id == user_id,
-        )
-
-        result = await db.execute(stmt)
-        record = result.scalar_one_or_none()
-        return record
+        return self._fallback_keywords(text, target_seniority)
 
     async def evaluate_resume(
-        self, resume_text: str, jd: str = None, jd_keywords: list = None
-    ):
-        """
-        通过function calling获取岗位、目标、约束，不再写死prompt
-        """
-        # 1. 先让AI分析JD，抽取岗位、目标、约束
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "extract_jd_info",
-                    "description": "从JD描述中提取岗位、目标、约束",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "role": {"type": "string", "description": "岗位名称"},
-                            "objective": {"type": "string", "description": "岗位目标"},
-                            "constraints": {
-                                "type": "string",
-                                "description": "岗位约束",
-                            },
-                        },
-                        "required": ["role", "objective", "constraints"],
-                    },
-                },
-            }
-        ]
-        jd_info_prompt = (
-            f"请从以下JD描述中提取岗位、目标、约束，调用extract_jd_info函数：\n{jd}"
-        )
-        jd_info_resp = await self.client_ai.aio.models.generate_content(
-            model=self.model_name,
-            contents=jd_info_prompt,
-            tools=tools,
-            config={"response_mime_type": "application/json"},
-        )
+        self,
+        resume_text: str,
+        jd_text: str,
+        jd_keywords: list[str] | None = None,
+        target_seniority: str | None = None,
+    ) -> dict:
+        extracted_keywords = await self._extract_jd_keywords(jd_text, target_seniority)
+        keywords = self._unique_strings(jd_keywords or extracted_keywords)
+
         try:
-            jd_info = json.loads(jd_info_resp.text)
+            structured_llm = self.llm.with_structured_output(EvaluationResult)
+            prompt = ChatPromptTemplate.from_messages(
+                [
+                    (
+                        "system",
+                        self.system_instruction
+                        + " 输出结构必须适合招聘评审，评分范围为0到100。",
+                    ),
+                    (
+                        "user",
+                        """
+                        请结合以下信息评估候选人：
+                        目标级别: {target_seniority}
+                        JD关键词: {keywords}
+
+                        JD全文:
+                        {jd_text}
+
+                        简历全文:
+                        {resume_text}
+
+                        请返回：
+                        - summary: 2到3句中文结论
+                        - title: 一句简短标题
+                        - decision: 明确结论
+                        - match_score: 0到100整数
+                        - radar_metrics: 4到6个维度，每个维度包含name、value、max
+                        - highlights: 3到5条亮点
+                        - risks: 2到4条风险
+                        """,
+                    ),
+                ]
+            )
+            raw_result = await (prompt | structured_llm).ainvoke(
+                {
+                    "target_seniority": target_seniority or "",
+                    "keywords": ", ".join(keywords),
+                    "jd_text": jd_text,
+                    "resume_text": resume_text,
+                }
+            )
+            result: EvaluationResult = self._coerce_model(raw_result, EvaluationResult)
+            payload = result.model_dump()
+            if not payload.get("radar_metrics"):
+                payload["radar_metrics"] = [
+                    metric.model_dump()
+                    for metric in self._build_radar_metrics(payload["match_score"])
+                ]
+            return payload
         except Exception:
-            jd_info = {"role": "", "objective": "", "constraints": ""}
+            return self._fallback_evaluation(resume_text, jd_text, keywords)
 
-        # 2. 生成评估prompt，动态拼接岗位、目标、约束
-        prompt = f"""
-        ROLE: {jd_info.get("role", "岗位未知")}
-        OBJECTIVE: {jd_info.get("objective", "目标未知")}
-        CONSTRAINTS: {jd_info.get("constraints", "无特殊约束")}
-        
-        JD描述: {jd}
-        JD关键词: {", ".join(jd_keywords or [])}
-        
-        评估以下简历，判定是否符合岗位要求，并输出结构化评估结果。
-        必须输出如下结构字段：
-            - radar_scores: [技术深度, 项目经验, 软技能, 背景实力, AI提效]，每项0-100分
-            - radar_indicators: [{"name": "技术深度", "max": 100}, ...]
-            - tech_stack_citations: 每个技术栈的引用原文片段数组
-            - key_achievements_citations: 每个成就的引用原文片段数组
-
-        INPUT_RESUME:
-        {resume_text}
-
-        OUTPUT_FORMAT:
-        
-        请严格按照如下JSON格式输出：
-        {{
-            "decision": "评估结论",
-            "match_score": 92,
-            "decision_range": "Highly Frontend Expert",
-            "radar_scores": [80, 90, 70, 85, 75],
-            "radar_indicators": [
-                {{"name": "技术深度", "max": 100}}, # 对比 JD 要求的框架深度（如 Vue3 原理、性能优化经验）
-                {{"name": "项目经验", "max": 100}}, # 对比简历中的项目复杂度和JD 要求的项目经验
-                {{"name": "软技能", "max": 100}}, # 对比 JD 要求的软技能
-                {{"name": "背景实力", "max": 100}}, # 对比 JD 要求的背景实力
-                {{"name": "AI提效", "max": 100}} # 对比 JD 要求的 AI 提效能力
-            ],
-            "tech_stack": ["Vue 2/3", "TypeScript", "Electron"],
-            "tech_stack_citations": ["原文片段1", "原文片段2", "原文片段3"],
-            "key_achievements": ["主导Electron桌面端重构", "JsonSchema元数据驱动"],
-            "key_achievements_citations": ["原文片段A", "原文片段B"],
-            "ai_bonus": "深度集成AI开发流",
-            "risks": ["2022年及2025年两段工作经历时间较短"]
-        }}
-        """
-
-        response = await self.client_ai.aio.models.generate_content(
-            model=self.model_name,
-            contents=prompt,
-            config={"response_mime_type": "application/json"},
-        )
-
-        # 转换为python对象
-        result = json.loads(response.text)
-        # 兼容前端字段
-        result["radarData"] = result.get("radar_scores")
-        result["radarIndicators"] = result.get("radar_indicators")
-        result["citations"] = (result.get("key_achievements_citations") or []) + (
-            result.get("tech_stack_citations") or []
-        )
-        return result
-
-    async def delete_old_vector_data(self, phone: str):
-        """
-        根据手机号从 ChromaDB 中删除旧数据
-        """
-        self.collection.delete(where={"phone": phone})
-
-    async def extract_info_from_resume(self, resume_text: str):
-        """
-        使用 AI 从简历中提取关键标识信息
-        """
-        prompt = f"""
-        请从以下简历内容中提取候选人的姓名和手机号。
-        如果简历中没有提到手机号，请返回 "None"。
-        
-        简历内容：
-        {resume_text}
-        
-        输出格式（JSON）：
-        {{
-            "candidate_name": "姓名",
-            "phone": "手机号"
-        }}
-        """
-        response = await self.client_ai.aio.models.generate_content(
-            model=self.model_name,
-            contents=prompt,
-            config={"response_mime_type": "application/json"},
-        )
-        return json.loads(response.text)
-
-    async def _extract_candidate_name(self, question=str):
-        """从用户问题中提取候选人姓名的简单方法，没有返回None"""
-        prompt = f"""
-        从以下问题中提取候选人姓名，如果没有明确的姓名，返回'None'：
-        问题：{question}
-        """
-        response = await self.client_ai.aio.models.generate_content(
-            model=self.model_name, contents=prompt
-        )
-        name = response.text.strip()
-        return name if name != "None" else None
-
-    async def _process_file_and_vector(
-        self, file_content: bytes, candidate_name: str, phone: str
-    ):
-        """
-        处理文件内容：解析文本，生成向量，存入ChromaDB
-        返回解析后的纯文本全文
-        """
+    async def ingest_resume(
+        self,
+        file_name: str,
+        file_content: bytes,
+        user_id: str,
+        resume_id: int,
+        candidate_name: str,
+        phone: str,
+    ) -> str:
+        suffix = Path(file_name).suffix.lower() or ".docx"
+        if suffix not in {".docx", ".pdf"}:
+            raise ValueError("仅支持 .docx 或 .pdf 格式的简历文件")
 
         temp_path = ""
-        raw_text = ""
-        # 1. 使用临时文件处理二进制流
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as temp_file:
-            temp_file.write(file_content)
-            temp_file.flush()  # 确保数据写入磁盘
-            temp_path = temp_file.name
         try:
-            # 2. 提取文本
-            raw_text = self.parser.extract_from_docx(temp_path)
-            chunks = self.parser.get_chunks(raw_text)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+                temp_file.write(file_content)
+                temp_path = temp_file.name
+
+            raw_text = self.parser.extract_text(temp_path)
         finally:
-            # 3. 删除临时文件
-            if os.path.exists(temp_path):
+            if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
 
-        self.collection.delete(where={"phone": phone})  # 删除旧数据
-        embeddings = [self._get_embedding(chunk) for chunk in chunks]
-        metadatas = [
-            {
-                "candidate_name": candidate_name,
-                "phone": phone,
-                "source": "uploaded_resume",
-            }
-            for _ in chunks
-        ]
-        ids = [f"{phone}_{i}" for i in range(len(chunks))]
+        if not raw_text.strip():
+            raise ValueError("简历内容为空，无法继续处理")
 
-        self.collection.upsert(
-            ids=ids,
-            metadatas=metadatas,
-            documents=chunks,
-            embeddings=embeddings,
+        chunks = self.parser.get_chunks(raw_text)
+        self.delete_resume_vectors(user_id=user_id, resume_id=resume_id)
+        self.vector_store.add_texts(
+            texts=chunks,
+            metadatas=[
+                {
+                    "user_id": user_id,
+                    "resume_id": str(resume_id),
+                    "candidate_name": candidate_name,
+                    "phone": phone,
+                }
+                for _ in chunks
+            ],
+            ids=[f"{user_id}:{resume_id}:{index}" for index in range(len(chunks))],
         )
         return raw_text
 
-    async def _update_status(
+    def delete_resume_vectors(
         self,
+        user_id: str,
+        resume_id: int | None = None,
+        candidate_name: str | None = None,
+    ) -> None:
+        where = self._build_vector_filter(
+            user_id=user_id, resume_id=resume_id, candidate_name=candidate_name
+        )
+        if where:
+            self.vector_store.delete(where=where)
+
+    async def ask(
+        self,
+        question: str,
+        user_id: str,
         db: AsyncSession,
-        resume_id: int,
-        new_status: ResumeStatus,
-        content: str = None,
-        evaluation_result: dict = None,
-    ):
-        """更新简历处理状态的辅助函数"""
-        stmt = update(Resume).where(Resume.id == resume_id).values(status=new_status)
-        if content is not None:
-            stmt = stmt.values(content=content)
-        if evaluation_result is not None:
-            stmt = stmt.values(evaluation_result=evaluation_result)
+        candidate_name: str | None = None,
+        resume_id: int | None = None,
+    ) -> str:
+        chunks: list[str] = []
+        async for chunk in self.stream_chat(
+            question=question,
+            user_id=user_id,
+            db=db,
+            candidate_name=candidate_name,
+            resume_id=resume_id,
+        ):
+            chunks.append(chunk)
+        return "".join(chunks)
 
-        stmt = stmt.values(updated_at=datetime.now())  # 更新状态时也更新updated_at字段
-
-        await db.execute(stmt)
-        await db.commit()
-        print(f"简历ID {resume_id} 状态已更新为 {new_status.value}")
-
-    async def handle_resume_process(
-        self, resume_id: int, file_content: bytes, candidate_name: str, phone: str
-    ):
-        # 这里需要一个新的db session
-        async with AsyncSessionLocal() as db:
-            try:
-                # 1. 更新数据库状态为解析中
-                await self._update_status(db, resume_id, ResumeStatus.PARSING)
-
-                raw_text = await self._process_file_and_vector(
-                    file_content, candidate_name, phone
-                )
-
-                await self._update_status(
-                    db, resume_id, ResumeStatus.EVALUATING, content=raw_text
-                )
-
-                evaluation_result = await self.evaluate_resume(raw_text)
-
-                await self._update_status(
-                    db,
-                    resume_id,
-                    ResumeStatus.COMPLETED,
-                    evaluation_result=evaluation_result,
-                )
-            except Exception as e:
-                print(f"更新状态失败: {e}")
-                await self._update_status(db, resume_id, ResumeStatus.FAILED)
-
-    async def add_resume(self, file_path, candidate_name, phone):
-        # 1. 提取并切分
-        doc_text = self.parser.extract_from_docx(file_path)
-        chunks = self.parser.get_chunks(doc_text)
-
-        self.collection.delete(where={"phone": phone})
-
-        # 生成向量
-        embeddings = [self._get_embedding(chunk) for chunk in chunks]
-
-        # 2. 准备元数据,每一段都带上候选人姓名
-        metadatas = [
-            {"candidate_name": candidate_name, "phone": phone, "source": file_path}
-            for _ in chunks
-        ]
-        ids = [f"{phone}_{i}" for i in range(len(chunks))]
-
-        # 3. 存入ChromaDB
-        self.collection.upsert(
-            ids=ids,
-            metadatas=metadatas,
-            documents=chunks,
-            embeddings=embeddings,
+    async def stream_chat(
+        self,
+        question: str,
+        user_id: str,
+        db: AsyncSession,
+        candidate_name: str | None = None,
+        resume_id: int | None = None,
+    ) -> AsyncIterator[str]:
+        chat_history = await self._load_history(user_id=user_id, db=db)
+        context = await self._retrieve_context(
+            question=question,
+            user_id=user_id,
+            candidate_name=candidate_name,
+            resume_id=resume_id,
         )
 
-        test_res = self.collection.get(limit=1)
-        print(f"📦 数据库状态检查: {test_res['documents']}")
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    self.system_instruction
+                    + " 如果检索内容不足以支撑结论，就明确说明证据不足。",
+                ),
+                MessagesPlaceholder(variable_name="chat_history"),
+                (
+                    "user",
+                    "相关简历片段:\n{context}\n\n用户问题:\n{question}",
+                ),
+            ]
+        )
+        chain = prompt | self.llm
 
-        return len(chunks)
+        response_parts: list[str] = []
+        try:
+            async for chunk in chain.astream(
+                {
+                    "chat_history": chat_history,
+                    "context": context or "未检索到匹配的简历片段。",
+                    "question": question,
+                }
+            ):
+                text = self._chunk_to_text(chunk)
+                if text:
+                    response_parts.append(text)
+                    yield text
+        except Exception:
+            fallback = self._build_chat_fallback(question=question, context=context)
+            response_parts.append(fallback)
+            yield fallback
 
-    async def _get_cache_key(self, user_id: str):
-        return f"chat_cache:{user_id}"
+        full_response = "".join(response_parts).strip()
+        await self._save_message(user_id=user_id, role="user", content=question, db=db)
+        await self._save_message(user_id=user_id, role="ai", content=full_response, db=db)
+
+    async def _retrieve_context(
+        self,
+        question: str,
+        user_id: str,
+        candidate_name: str | None,
+        resume_id: int | None,
+    ) -> str:
+        search_kwargs: dict[str, object] = {"k": 6}
+        where = self._build_vector_filter(
+            user_id=user_id, resume_id=resume_id, candidate_name=candidate_name
+        )
+        if where:
+            search_kwargs["filter"] = where
+
+        try:
+            docs = await self.vector_store.as_retriever(search_kwargs=search_kwargs).ainvoke(
+                question
+            )
+        except Exception:
+            return ""
+
+        return "\n\n".join(doc.page_content for doc in docs)
 
     async def _save_message(
-        self, user_id: str, role: str, content: str, db: AsyncSession = None
-    ):
-        """双写逻辑：PG 永久存，Redis 更新缓存"""
+        self, user_id: str, role: str, content: str, db: AsyncSession
+    ) -> None:
+        db.add(ChatMessage(user_id=user_id, role=role, content=content))
+        await db.flush()
+        await self._cache_delete(await self._get_cache_key(user_id))
 
-        # 1. 写入PostgreSQL数据库
-        new_message = ChatMessage(
-            user_id=user_id,
-            role=role,
-            content=content,
-        )
-        db.add(new_message)
-
-        # 2. 更新Redis缓存
+    async def _load_history(self, user_id: str, db: AsyncSession) -> list[BaseMessage]:
         cache_key = await self._get_cache_key(user_id)
-        await self.redis_client.delete(
-            cache_key
-        )  # 删除旧缓存，下一次查询会从PG加载最新数据
+        cached = await self._cache_get(cache_key)
+        if cached:
+            return self._history_from_cache(cached)
 
-    async def _load_history(self, user_id, limit: int = 10, db: AsyncSession = None):
-        """双级缓存查询 Redis->PG"""
-        cache_key = await self._get_cache_key(user_id)
-
-        # 1. 先查Redis缓存
-        cached_data = await self.redis_client.get(cache_key)
-        if cached_data:
-            print(f"从Redis缓存中加载用户 {user_id} 的历史记录")
-            return json.loads(cached_data)
-
-        """ redis没命中，从PG加载最近的历史记录"""
-        print(f"[PG]Redis未命中，从数据库中读取用户 {user_id} 的历史记录")
-
-        # 查最近的N条，按时间降序排列
         stmt = (
             select(ChatMessage)
             .where(ChatMessage.user_id == user_id)
-            .order_by(ChatMessage.created_at.desc())
-            .limit(limit)
+            .order_by(ChatMessage.created_at.asc())
+            .limit(12)
         )
         result = await db.execute(stmt)
-        messages = result.scalars().all()
-        # 转换成模型需要的格式，注意要逆序（从旧到新）
-        history = [
-            {"role": msg.role, "parts": [{"text": msg.content}]}
-            for msg in reversed(messages)
-        ]
+        messages = cast(list[ChatMessage], result.scalars().all())
+        await self._cache_set(
+            cache_key,
+            json.dumps(
+                [{"role": message.role, "content": message.content} for message in messages],
+                ensure_ascii=False,
+            ),
+        )
+        return [self._to_langchain_message(message.role, message.content) for message in messages]
 
-        if history:
-            # 加载到Redis缓存，设置过期时间
-            await self.redis_client.setex(
-                cache_key, self.cache_expire, json.dumps(history)
-            )
+    async def _get_cache_key(self, user_id: str) -> str:
+        return f"chat_cache:{user_id}"
 
+    async def _cache_get(self, key: str) -> str | None:
+        if not self.redis_client:
+            return None
+        return await self.redis_client.get(key)
+
+    async def _cache_set(self, key: str, value: str) -> None:
+        if self.redis_client:
+            await self.redis_client.setex(key, self.cache_expire, value)
+
+    async def _cache_delete(self, key: str) -> None:
+        if self.redis_client:
+            await self.redis_client.delete(key)
+
+    def _history_from_cache(self, cached: str) -> list[BaseMessage]:
+        try:
+            payload = json.loads(cached)
+        except json.JSONDecodeError:
+            return []
+
+        history: list[BaseMessage] = []
+        for item in payload:
+            role = str(item.get("role", ""))
+            content = str(item.get("content", ""))
+            if content:
+                history.append(self._to_langchain_message(role, content))
         return history
 
-    def _get_embedding(self, text: str):
-        result = self.client_ai.models.embed_content(
-            model=os.getenv("GEMINI_EMBEDDING_MODEL_NAME"), contents=text
-        )
-        return result.embeddings[0].values
+    def _coerce_model(self, value: Any, model_type: type[ModelT]) -> ModelT:
+        if isinstance(value, model_type):
+            return value
+        if isinstance(value, dict):
+            return model_type.model_validate(value)
+        if hasattr(value, "model_dump"):
+            return model_type.model_validate(value.model_dump())
+        return model_type.model_validate(value)
 
-    async def ask(
-        self, question: str, user_id: str, search_filter=None, db: AsyncSession = None
-    ):
-        if not db:
-            raise ValueError("Database session is required")
-        # 1. 如果会话没有创建，尝试从磁盘恢复
-        if user_id not in self.sessions:
-            print(f"为用户 {user_id} 创建新会话")
-            user_history = await self._load_history(user_id, db=db)
-            self.histories[user_id] = user_history
-
-            self.sessions[user_id] = self.client_ai.aio.chats.create(
-                model=self.model_name,
-                history=user_history,  # 关键：把历史喂给新会话
-                config={
-                    "system_instruction": self.system_instruction,
-                    "tools": [get_project_tech_stack, get_current_date],
-                },
-            )
-
-        # 2. 完整的RAG问答流程
-        detected_name = (
-            await self._extract_candidate_name(question)
-            if not search_filter
-            else search_filter.get("candidate_name")
-        )
-        enhanced_query = (
-            f"候选人:{detected_name} {question}" if detected_name else question
-        )
-
-        query_vector = self._get_embedding(enhanced_query)
-
-        results = self.collection.query(
-            query_embeddings=[query_vector],
-            n_results=8,
-        )
-
-        context = (
-            "\n".join(results["documents"][0])
-            if results["documents"][0]
-            else "(未找到相关简历描述)"
-        )
-
-        # 3. 构造增强prompt
-        full_input = f"【参考背景】：{context}\n\n【用户问题】：{question}"
-
-        # 4. 使用chat_session.send_message_stream获取流式响应，边生成边存储完整回答内容
-        full_response_content = ""
+    def _load_rapidocr_module(self):
         try:
-            response_stream = await self.sessions[user_id].send_message_stream(
-                full_input
-            )
-            async for chunk in response_stream:
-                if chunk.text:
-                    content = chunk.text
-                    full_response_content += content
-                    yield content
-        except Exception as e:
-            error_msg = f"\n[服务异常]: {str(e)}"
-            yield error_msg
-            full_response_content += error_msg
+            return importlib.import_module("rapidocr_onnxruntime")
+        except ImportError:
+            return None
 
-        # 5. 持久化：每次对话完，更新磁盘上的记忆
-        self.histories[user_id].append({"role": "user", "parts": [{"text": question}]})
-        self.histories[user_id].append(
-            {"role": "model", "parts": [{"text": full_response_content}]}
+    def _to_langchain_message(self, role: str, content: str) -> BaseMessage:
+        if role == "user":
+            return HumanMessage(content=content)
+        return AIMessage(content=content)
+
+    def _build_vector_filter(
+        self,
+        user_id: str,
+        resume_id: int | None = None,
+        candidate_name: str | None = None,
+    ) -> dict | None:
+        clauses = [{"user_id": user_id}]
+        if resume_id is not None:
+            clauses.append({"resume_id": str(resume_id)})
+        if candidate_name:
+            clauses.append({"candidate_name": candidate_name})
+
+        if len(clauses) == 1:
+            return clauses[0]
+        return {"$and": clauses}
+
+    def _fallback_keywords(self, text: str, target_seniority: str | None = None) -> list[str]:
+        stopwords = {
+            "负责",
+            "熟悉",
+            "能力",
+            "经验",
+            "优先",
+            "相关",
+            "以上",
+            "具备",
+            "参与",
+            "本科",
+            "大专",
+            "岗位",
+            "职位",
+            "工作",
+            "公司",
+            "团队",
+            "产品",
+            "业务",
+            "要求",
+            "能够",
+            "我们",
+            "你将",
+        }
+        library = [
+            "Python",
+            "Java",
+            "Go",
+            "C++",
+            "JavaScript",
+            "TypeScript",
+            "React",
+            "Vue",
+            "Node.js",
+            "SQL",
+            "MySQL",
+            "PostgreSQL",
+            "Redis",
+            "Kafka",
+            "Docker",
+            "Kubernetes",
+            "LangChain",
+            "RAG",
+            "LLM",
+            "AI",
+            "机器学习",
+            "深度学习",
+            "数据分析",
+            "项目管理",
+            "沟通协作",
+        ]
+        matched_library = [item for item in library if item.lower() in text.lower()]
+        tokens = re.findall(r"[A-Za-z][A-Za-z0-9+#./-]{1,}|[\u4e00-\u9fff]{2,8}", text)
+        keywords = [token for token in tokens if token not in stopwords and len(token) >= 2]
+        if target_seniority and target_seniority.lower() in text.lower():
+            keywords.append(target_seniority)
+        return self._unique_strings([*matched_library, *keywords])[:8]
+
+    def _normalize_keyword_candidates(self, candidates: Iterable[str], text: str) -> list[str]:
+        normalized: list[str] = []
+        for candidate in candidates:
+            keyword = candidate.strip().strip("，,。；;:：()[]{}")
+            if len(keyword) < 2 or len(keyword) > 30:
+                continue
+
+            match = re.search(re.escape(keyword), text, flags=re.IGNORECASE)
+            if match:
+                normalized.append(match.group(0).strip())
+
+        return self._unique_strings(normalized)
+
+    def _fallback_evaluation(
+        self, resume_text: str, jd_text: str, jd_keywords: Iterable[str]
+    ) -> dict:
+        lowered_resume = resume_text.lower()
+        keywords = self._unique_strings(list(jd_keywords))
+        matched = [keyword for keyword in keywords if keyword.lower() in lowered_resume]
+        coverage = len(matched) / max(len(keywords), 1)
+        match_score = max(45, min(95, round(coverage * 100))) if keywords else 60
+        title = "高度匹配" if match_score >= 80 else "有一定匹配度" if match_score >= 65 else "建议谨慎评估"
+        summary = (
+            f"候选人与JD的整体匹配度约为 {match_score} 分。"
+            f"当前证据主要来自简历中出现的关键词：{', '.join(matched[:4]) or '暂未识别到明确重合项'}。"
         )
+        highlights = [
+            f"简历中明确出现关键词：{keyword}" for keyword in matched[:4]
+        ] or ["简历已成功解析，可继续结合项目经历人工复核。"]
+        risks = []
+        missing = [keyword for keyword in keywords if keyword not in matched]
+        if missing:
+            risks.append(f"以下JD关键词在简历中缺少直接证据：{', '.join(missing[:4])}")
+        risks.append("当前结果为降级评估，建议结合面试继续确认细节。")
+        radar_metrics = [
+            metric.model_dump()
+            for metric in self._build_radar_metrics(match_score)
+        ]
+        return {
+            "summary": summary,
+            "title": title,
+            "decision": title,
+            "match_score": match_score,
+            "radar_metrics": radar_metrics,
+            "highlights": highlights,
+            "risks": risks,
+        }
 
-        # 6. 异步写入数据库
-        await self._save_message(user_id, "user", question, db=db)
-        await self._save_message(user_id, "model", full_response_content, db=db)
+    def _build_radar_metrics(self, match_score: int) -> list[RadarMetric]:
+        metric_names = ["技术深度", "项目经验", "软技能", "背景示例", "AI技能"]
+        offsets = [0, -6, -10, -4, -8]
+        metrics: list[RadarMetric] = []
+        for index, name in enumerate(metric_names):
+            value = max(0, min(100, match_score + (offsets[index] if index < len(offsets) else -8)))
+            metrics.append(RadarMetric(name=name, value=value))
+        return metrics
 
+    def _chunk_to_text(self, chunk) -> str:
+        content = getattr(chunk, "content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "".join(parts)
+        return ""
 
-# 程序入口
-async def main():
-    # 初始化agent
-    # agent = ResumeAgent()
+    def _build_chat_fallback(self, question: str, context: str) -> str:
+        if context:
+            snippet = context[:500]
+            return (
+                "模型流式调用失败，以下是基于已检索简历片段的降级回答："
+                f"\n问题：{question}\n简历证据：{snippet}"
+            )
+        return "暂时无法生成回答，因为没有检索到可用的简历上下文。"
 
-    print("AI职业经纪人已启动，输入'exit'退出")
-
-    # # 准备简历数据
-    # resumes = [
-    #     {
-    #         "id": "exp_1",
-    #         "text": "9年研发经验，熟悉架构设计，主导过多个大型项目的开发。",
-    #     },
-    #     {"id": "exp_2", "text": "擅长金融量化交易系统开发，熟悉A股交易机制"},
-    # ]
-
-    # # 同步数据
-    # agent.sync_data(resumes)
-
-    # while True:
-    #     user_input = input("请输入问题：")
-    #     if user_input.lower() == "exit":
-    #         print("退出程序")
-    #         break
-    #     answer = await agent.ask(user_input, user_id)
-    #     print(f"AI的回答是：{answer}")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    def _unique_strings(self, values: Iterable[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for value in values:
+            text = str(value).strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(text)
+        return result
